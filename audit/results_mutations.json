@@ -1,0 +1,125 @@
+{
+  "total": 17,
+  "killed": 17,
+  "rows": [
+    {
+      "verdict": "KILLED",
+      "name": "key validation removed",
+      "failed_tests": 10,
+      "detail": "10 failed, 1 skipped, 345 deselected, 1 warning in 0.60s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "_get_stream reads with universal newlines",
+      "failed_tests": 7,
+      "detail": "7 failed, 1 passed, 1 skipped, 347 deselected in 0.59s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "default never applied",
+      "failed_tests": 5,
+      "detail": "5 failed, 8 passed, 1 skipped, 342 deselected in 0.54s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "new line always LF",
+      "failed_tests": 5,
+      "detail": "5 failed, 12 passed, 1 skipped, 338 deselected in 0.87s",
+      "script": "evidence/run_mutations2.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "rewrite writes with universal newlines",
+      "failed_tests": 5,
+      "detail": "5 failed, 6 passed, 1 skipped, 344 deselected in 0.74s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "new line always CRLF",
+      "failed_tests": 4,
+      "detail": "4 failed, 13 passed, 1 skipped, 338 deselected in 0.63s",
+      "script": "evidence/run_mutations2.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "new line uses os.linesep",
+      "failed_tests": 4,
+      "detail": "4 failed, 13 passed, 1 skipped, 338 deselected in 0.61s",
+      "script": "evidence/run_mutations2.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "BOM not re-emitted",
+      "failed_tests": 3,
+      "detail": "3 failed, 1 skipped, 352 deselected in 0.58s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "CLI reads with the process locale",
+      "failed_tests": 2,
+      "detail": "2 failed, 1 passed, 1 skipped, 352 deselected, 2 warnings in 0.95s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "empty value does not use the default",
+      "failed_tests": 2,
+      "detail": "2 failed, 11 passed, 1 skipped, 342 deselected in 0.54s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "line terminator detection removed (fallback only)",
+      "failed_tests": 2,
+      "detail": "2 failed, 15 passed, 1 skipped, 338 deselected in 0.47s",
+      "script": "evidence/run_mutations2.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "rewrite reads with universal newlines",
+      "failed_tests": 2,
+      "detail": "2 failed, 9 passed, 1 skipped, 344 deselected in 0.56s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "append to a file without a trailing newline glues the lines",
+      "failed_tests": 1,
+      "detail": "1 failed, 5 passed, 1 skipped, 349 deselected in 0.48s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "bare declarations mask the environment",
+      "failed_tests": 1,
+      "detail": "1 failed, 1 skipped, 354 deselected in 0.43s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "load_dotenv returns True for valueless-only content",
+      "failed_tests": 1,
+      "detail": "1 failed, 4 passed, 1 skipped, 350 deselected in 0.54s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "parse_variables back to the quadratic regex",
+      "failed_tests": 1,
+      "detail": "1 failed, 13 passed, 1 skipped, 341 deselected in 12.42s",
+      "script": "evidence/run_mutations.py"
+    },
+    {
+      "verdict": "KILLED",
+      "name": "parser recovery consumes only CR",
+      "failed_tests": 1,
+      "detail": "1 failed, 5 passed, 1 skipped, 349 deselected in 0.45s",
+      "script": "evidence/run_mutations.py"
+    }
+  ]
+}

@@ -1,0 +1,858 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e5f2541..29ec3d0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ - `set_key` and `unset_key` no longer leave a `.tmp_*` file behind on Windows when writing a read-only `.env` fails, and the error raised is the one from the failed write rather than from cleaning up the temporary file by [@MohammedAlkindi] in [#686]
+ - `load_dotenv`, `dotenv_values`, `get_key`, `set_key`, `unset_key` and the CLI `--file` option now expand a leading `~` to the user's home directory by [@veeceey] in [#615]
+ - `find_dotenv` and the IPython `%dotenv` magic now expand a leading `~` in the file name by [@theskumar] in [#714]
++- `set_key`, `unset_key` and the CLI `set`/`unset` commands no longer convert the line endings of a `.env` file: reading and writing are done with `newline=""`, so a CRLF file keeps CRLF on every platform and a new line follows the terminator of its neighbours
++- `set_key` and `unset_key` no longer drop a leading UTF-8 BOM, and a carriage return inside a value now survives the write/read round-trip instead of being read back as `\n`
++- `dotenv list` and `dotenv get` decode the `.env` file as UTF-8, matching what `set_key` and `dotenv set` write, instead of following the process locale (GBK on Chinese Windows produced mojibake or a `UnicodeDecodeError`). An undecodable file now prints an error and exits with code 2 instead of raising a traceback
++- `set_key` now rejects a key it cannot write faithfully (one containing whitespace, `=`, `#`, a quote at either end, or the empty string) instead of writing a line that is read back as a different variable while reporting success
++- `dotenv_values` now uses the default in `${name:-default}` when the variable is set but empty (POSIX semantics); a value of `"0"` is still treated as a real value, not as empty
++- A bare `NAME` declaration no longer masks a real environment variable of the same name when a later value is expanded with `${NAME}`
++- `load_dotenv` now returns `False` for content holding only valueless declarations, matching its documented contract of returning `True` only when at least one variable was set
++- Parsing a CRLF stream after a malformed statement now consumes the whole `\r\n` instead of leaving the `\n` for the next binding, which shifted the line numbers of later warnings and made `set_key`/`unset_key` glue two lines together when a statement was removed
++- `parse_variables` is now linear instead of quadratic on an unterminated expansion: a value made of many `${` with no `}` used to take ~1.8 s for 16 KB and ~7.7 s for 32 KB
+ 
+ ## [1.2.4] - 2026-10-01
+ 
+diff --git a/src/dotenv/cli.py b/src/dotenv/cli.py
+index c06c706..5d9c41b 100644
+--- a/src/dotenv/cli.py
++++ b/src/dotenv/cli.py
+@@ -71,15 +71,23 @@ def stream_file(path: os.PathLike) -> Iterator[IO[str]]:
+     """
+     Open a file and yield the corresponding (decoded) stream.
+ 
+-    Exits with error code 2 if the file cannot be opened.
++    The file is decoded as UTF-8, matching what `set_key` and `dotenv set`
++    write. Falling back to the process locale (e.g. GBK on Chinese Windows)
++    made `dotenv get`/`dotenv list` print mojibake, or fail outright with a
++    UnicodeDecodeError, for a file the same tool had just written.
++
++    Exits with error code 2 if the file cannot be opened or decoded.
+     """
+ 
+     try:
+-        with open(path) as stream:
++        with open(path, encoding="utf-8") as stream:
+             yield stream
+     except OSError as exc:
+         print(f"Error opening env file: {exc}", file=sys.stderr)
+         sys.exit(2)
++    except UnicodeDecodeError as exc:
++        print(f"Error decoding env file: {exc}", file=sys.stderr)
++        sys.exit(2)
+ 
+ 
+ @cli.command(name="list")
+diff --git a/src/dotenv/main.py b/src/dotenv/main.py
+index 5faa7f0..cb792a7 100644
+--- a/src/dotenv/main.py
++++ b/src/dotenv/main.py
+@@ -2,6 +2,7 @@ import io
+ import logging
+ import os
+ import pathlib
++import re
+ import stat
+ import sys
+ import tempfile
+@@ -18,6 +19,9 @@ StrPath = Union[str, "os.PathLike[str]"]
+ 
+ logger = logging.getLogger(__name__)
+ 
++# CRLF before CR/LF so a CRLF pair is matched as one terminator.
++_line_break = re.compile(r"\r\n|\n|\r")
++
+ 
+ def _load_dotenv_disabled() -> bool:
+     """
+@@ -64,7 +68,11 @@ class DotEnv:
+     @contextmanager
+     def _get_stream(self) -> Iterator[IO[str]]:
+         if self.dotenv_path and _is_file_or_fifo(self.dotenv_path):
+-            with open(self.dotenv_path, encoding=self.encoding) as stream:
++            # `newline=""` keeps carriage returns intact, so a value holding one
++            # survives the read instead of being flattened to "\n". Reading a
++            # path and reading the same bytes from a stream must agree, and the
++            # parser handles CRLF, CR and LF itself.
++            with open(self.dotenv_path, encoding=self.encoding, newline="") as stream:
+                 yield stream
+         elif self.stream is not None:
+             yield self.stream
+@@ -101,8 +109,15 @@ class DotEnv:
+     def set_as_environment_variables(self) -> bool:
+         """
+         Load the current dotenv as system environment variable.
++
++        Returns True if at least one environment variable was set.
+         """
+-        if not self.dict():
++        # A file holding only bare declarations (`FOO` with no `=`) parses to
++        # `{"FOO": None}`. Those entries are ignored below, so nothing reaches
++        # `os.environ` and the documented contract -- True when at least one
++        # variable was set -- is not met. `KEY=` still counts: it sets an empty
++        # value.
++        if not any(value is not None for value in self.dict().values()):
+             return False
+ 
+         for k, v in self.dict().items():
+@@ -168,7 +183,15 @@ def rewrite(
+         path = os.path.realpath(path)
+ 
+     try:
+-        source: IO[str] = open(path, encoding=encoding)
++        # `newline=""` disables universal-newline translation in both
++        # directions. Without it, reading turns CRLF and lone CR into "\n" and
++        # writing turns every "\n" back into `os.linesep`, so `set_key` on a
++        # CRLF file under Linux produced an LF file and on Windows rewrote an
++        # LF file to CRLF -- i.e. it silently converted the whole file instead
++        # of touching one line. It also turned a carriage return *inside* a
++        # value into "\n", breaking the write/read round-trip that `set_key`
++        # promises. The parser understands CRLF, CR and LF on its own.
++        source: IO[str] = open(path, encoding=encoding, newline="")
+         try:
+             path_stat = os.lstat(path)
+             original_mode: Optional[int] = (
+@@ -187,6 +210,7 @@ def rewrite(
+         temp_file = tempfile.NamedTemporaryFile(
+             mode="w",
+             encoding=encoding,
++            newline="",
+             delete=False,
+             prefix=".tmp_",
+             dir=os.path.dirname(os.path.abspath(path)),
+@@ -201,6 +225,16 @@ def rewrite(
+         dest_path = pathlib.Path(dest.name)
+         error = None
+ 
++        # The parser strips a leading BOM before producing bindings, so it
++        # never reaches `Binding.original.string` and would be dropped by the
++        # rewrite. Detect it here and re-emit it verbatim, otherwise `set_key`
++        # and `unset_key` silently convert a BOM-prefixed file to a plain one.
++        first = source.read(1)
++        if first == "\ufeff":
++            dest.write(first)
++        else:
++            source.seek(0)
++
+         try:
+             with source:
+                 yield (source, dest)
+@@ -221,6 +255,57 @@ def rewrite(
+         raise error from None
+ 
+ 
++def _detect_newline(text: str) -> str:
++    """
++    Return the line ending used by `text`, defaulting to "\\n" for an empty
++    or single-line file.
++
++    `rewrite` echoes the untouched lines back verbatim, so a new line has to
++    use the same terminator as the line it follows; otherwise a CRLF file ends
++    up with one LF line in the middle of it. The terminator of the *last*
++    terminated line is used rather than the first one, so a file whose lines
++    were written by different tools keeps the convention of the line the new
++    entry is appended to.
++    """
++    if text.endswith("\r\n"):
++        return "\r\n"
++    if text.endswith("\n"):
++        return "\n"
++    if text.endswith("\r"):
++        return "\r"
++
++    # No terminator at the very end: use the last one that appears, which is
++    # the convention of the final complete line. Matching the alternatives in
++    # one pass is what keeps the "\n" of a CRLF pair from being read as a lone
++    # LF (searching for "\n" and "\r" separately does exactly that).
++    matches = _line_break.findall(text)
++    return matches[-1] if matches else "\n"
++
++
++def _check_key_is_writable(key: str) -> None:
++    """
++    Reject a key that `set_key` cannot write faithfully.
++
++    The key is interpolated straight into the output line and never quoted, so
++    a key containing `=`, `#`, whitespace or a newline is read back as a
++    *different* variable -- or is lost entirely -- while `set_key` still
++    reports success. Only keys the parser can read back unchanged are
++    accepted; the check mirrors what `parse_key` accepts.
++    """
++    if not key:
++        raise ValueError("Key cannot be empty")
++
++    # A quoted key would be read back without its quotes, i.e. as another name.
++    if key[0] == "'" or key[-1] == "'":
++        raise ValueError(f"Key cannot start or end with a quote: {key!r}")
++
++    for char in key:
++        if char in "=#":
++            raise ValueError(f"Key cannot contain {char!r}: {key!r}")
++        if char.isspace():
++            raise ValueError(f"Key cannot contain whitespace: {key!r}")
++
++
+ def set_key(
+     dotenv_path: StrPath,
+     key_to_set: str,
+@@ -245,6 +330,7 @@ def set_key(
+         dotenv_path = pathlib.Path(dotenv_path).expanduser()
+     if quote_mode not in ("always", "auto", "never"):
+         raise ValueError(f"Unknown quote_mode: {quote_mode}")
++    _check_key_is_writable(key_to_set)
+ 
+     quote = quote_mode == "always" or (
+         quote_mode == "auto" and not value_to_set.isalnum()
+@@ -260,26 +346,31 @@ def set_key(
+     else:
+         value_out = value_to_set
+     if export:
+-        line_out = f"export {key_to_set}={value_out}\n"
++        line = f"export {key_to_set}={value_out}"
+     else:
+-        line_out = f"{key_to_set}={value_out}\n"
++        line = f"{key_to_set}={value_out}"
+ 
+     with rewrite(dotenv_path, encoding=encoding, follow_symlinks=follow_symlinks) as (
+         source,
+         dest,
+     ):
++        # Read once so the line terminator of the file can be detected; the
++        # bindings are produced from the same text so nothing is parsed twice.
++        text = source.read()
++        newline = _detect_newline(text)
++        line_out = line + newline
+         replaced = False
+         missing_newline = False
+-        for mapping in with_warn_for_invalid_lines(parse_stream(source)):
++        for mapping in with_warn_for_invalid_lines(parse_stream(io.StringIO(text))):
+             if mapping.key == key_to_set:
+                 dest.write(line_out)
+                 replaced = True
+             else:
+                 dest.write(mapping.original.string)
+-                missing_newline = not mapping.original.string.endswith("\n")
++                missing_newline = not mapping.original.string.endswith(("\n", "\r"))
+         if not replaced:
+             if missing_newline:
+-                dest.write("\n")
++                dest.write(newline)
+             dest.write(line_out)
+ 
+     return True, key_to_set, value_to_set
+@@ -342,11 +433,17 @@ def resolve_variables(
+         else:
+             atoms = parse_variables(value)
+             env: Dict[str, Optional[str]] = {}
++            # A bare `NAME` line parses to `None` and stays in `new_values` as
++            # such. Feeding that `None` to the expansion mapping would hide a
++            # real value of `NAME` in the environment, so a later `${NAME}`
++            # expanded to "" instead of the environment value. Skip the
++            # valueless entries when building the lookup.
++            defined = {k: v for k, v in new_values.items() if v is not None}
+             if override:
+                 env.update(os.environ)  # type: ignore
+-                env.update(new_values)
++                env.update(defined)
+             else:
+-                env.update(new_values)
++                env.update(defined)
+                 env.update(os.environ)  # type: ignore
+             result = "".join(atom.resolve(env) for atom in atoms)
+ 
+diff --git a/src/dotenv/parser.py b/src/dotenv/parser.py
+index d9d4758..3347295 100644
+--- a/src/dotenv/parser.py
++++ b/src/dotenv/parser.py
+@@ -29,7 +29,11 @@ _double_quoted_value = make_regex(r'"((?:\\.|[^"\\])*)"', extra_flags=re.DOTALL)
+ _unquoted_value = make_regex(r"([^\r\n]*)")
+ _comment = make_regex(r"(?:[^\S\r\n]*#[^\r\n]*)?")
+ _end_of_line = make_regex(r"[^\S\r\n]*(?:\r\n|\n|\r|$)")
+-_rest_of_line = make_regex(r"[^\r\n]*(?:\r|\n|\r\n)?")
++# `\r\n` must be tried before `\r`: alternation is first-match-wins, so the
++# other order consumes only the `\r` of a CRLF pair and leaves the `\n` to be
++# attributed to the *next* statement. When that next statement is rewritten or
++# removed, the leftover `\n` goes with it and the two lines are glued together.
++_rest_of_line = make_regex(r"[^\r\n]*(?:\r\n|\r|\n)?")
+ _double_quote_escapes = make_regex(r"\\[\\'\"abfnrtv]")
+ _single_quote_escapes = make_regex(r"\\[\\']")
+ 
+diff --git a/src/dotenv/variables.py b/src/dotenv/variables.py
+index 667f2f2..7fdc3a1 100644
+--- a/src/dotenv/variables.py
++++ b/src/dotenv/variables.py
+@@ -1,8 +1,10 @@
+ import re
+ from abc import ABCMeta, abstractmethod
+-from typing import Iterator, Mapping, Optional, Pattern
++from typing import Iterator, Mapping, Optional
+ 
+-_posix_variable: Pattern[str] = re.compile(
++# Kept as the readable specification of the supported syntax; `parse_variables`
++# implements the same grammar as a linear scan (see the note there).
++_posix_variable = re.compile(
+     r"""
+     \$\{
+         (?P<name>[^\}:]*)
+@@ -62,24 +64,67 @@ class Variable(Atom):
+         return hash((self.__class__, self.name, self.default))
+ 
+     def resolve(self, env: Mapping[str, Optional[str]]) -> str:
+-        default = self.default if self.default is not None else ""
+-        result = env.get(self.name, default)
+-        return result if result is not None else ""
++        # `${name:-default}` is the POSIX form that substitutes the default
++        # when `name` is unset *or* null (the empty string). `env.get` alone
++        # cannot express that: a key present with "" is returned as "" and the
++        # default is skipped.
++        #
++        # The emptiness test is written out rather than `if not result` because
++        # the mapping is typed `Optional[str]` but callers can hand in any
++        # mapping; an explicit comparison keeps the rule ("unset or empty
++        # string") from silently changing meaning if a falsy non-string value
++        # ever reaches it.
++        result = env.get(self.name)
++        if result is None or result == "":
++            return self.default if self.default is not None else ""
++        return result
+ 
+ 
+ def parse_variables(value: str) -> Iterator[Atom]:
++    # `finditer` with the pattern above is quadratic on an unterminated
++    # expansion: `[^}:]*` is greedy, so for a value holding N occurrences of
++    # `${` and no `}` at all the engine swallows the whole tail and then
++    # backtracks one character at a time at every start position. A 16 KB value
++    # of `${` repeated took ~1.8 s and 32 KB took ~7.7 s, so a truncated or
++    # hostile `.env` value stalled `load_dotenv` (and `dotenv run`).
++    #
++    # Scanning for the literal `${` first and then locating the closing `}`
++    # yields exactly the same atoms -- `[^}:]*` can never match a `$`, `:` or
++    # `}`, so the first candidate match after a `${` always starts there -- but
++    # each start position is visited once, making the whole pass linear.
+     cursor = 0
+-
+-    for match in _posix_variable.finditer(value):
+-        (start, end) = match.span()
+-        name = match["name"]
+-        default = match["default"]
++    search_from = 0
++
++    while True:
++        start = value.find("${", search_from)
++        if start < 0:
++            break
++
++        close = value.find("}", start + 2)
++        if close < 0:
++            # No `}` anywhere after this `${`, so no expansion can match; the
++            # rest of the value is literal text (same as the regex engine).
++            break
++
++        body = value[start + 2 : close]
++        # `[^}:]*` stops at the first `:`, so the default separator can only be
++        # the two characters right after that first colon.
++        separator = body.find(":")
++        if separator < 0:
++            name, default = body, None
++        elif body[separator : separator + 2] == ":-":
++            name, default = body[:separator], body[separator + 2 :]
++        else:
++            # A `:` that is not part of `:-` cannot appear in a name, so this
++            # `${` does not start an expansion; try the next one.
++            search_from = start + 1
++            continue
+ 
+         if start > cursor:
+             yield Literal(value=value[cursor:start])
+ 
+         yield Variable(name=name, default=default)
+-        cursor = end
++        cursor = search_from = close + 1
+ 
+     length = len(value)
+     if cursor < length:
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 8123c9d..36f370f 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -1,12 +1,15 @@
+ import os
++import subprocess
+ import sys
+ from pathlib import Path
+ from typing import Optional
++from unittest import mock
+ 
+ import pytest
+ 
+ import dotenv
+ from dotenv.cli import cli as dotenv_cli
++from dotenv.cli import stream_file
+ from dotenv.version import __version__
+ from tests.test_lib import check_process, run_dotenv
+ 
+@@ -415,3 +418,89 @@ def test_run_with_dotenv_and_command_flags(dotenv_path, tmp_path):
+ 
+     check_process(result, exit_code=0)
+     assert result.stdout.strip().startswith("dotenv, version")
++
++
++def test_stream_file_decodes_as_utf8(cli, dotenv_path):
++    """
++    `dotenv set` writes UTF-8 (`set_key`'s default encoding), so `list`/`get`
++    must read UTF-8 too. `stream_file` used `open(path)` with no encoding,
++    which follows the process locale -- GBK on Chinese Windows -- so a file the
++    same tool had just written came back as mojibake, or raised
++    UnicodeDecodeError for characters the locale could not represent.
++
++    This asserts the encoding structurally because `open()` resolves the
++    locale in C: monkeypatching `locale.getpreferredencoding` does not affect
++    it, so a behavioural test passes on a UTF-8 CI machine either way.
++    """
++    dotenv_path.write_bytes("A=1\n".encode())
++    seen = []
++    real_open = open
++
++    def tracking_open(*args, **kwargs):
++        seen.append(kwargs.get("encoding"))
++        return real_open(*args, **kwargs)
++
++    with mock.patch("builtins.open", tracking_open):
++        with stream_file(dotenv_path) as stream:
++            stream.read()
++
++    assert seen == ["utf-8"]
++
++
++@pytest.mark.skipif(
++    sys.platform != "win32", reason="needs a non-UTF-8 process locale (cp936)"
++)
++def test_cli_round_trips_non_ascii_under_a_gbk_process_locale(tmp_path):
++    """
++    End-to-end: `dotenv set` then `dotenv get` in a real subprocess whose
++    locale is GBK, which is what a Chinese Windows console uses.
++    """
++    dotenv_path = tmp_path / ".env"
++    dotenv_path.write_bytes(b"")
++    env = {
++        **os.environ,
++        "PYTHONUTF8": "0",
++        "PYTHONIOENCODING": "utf-8",
++    }
++    env.pop("LC_ALL", None)
++    env.pop("LANG", None)
++
++    def run(*args):
++        return subprocess.run(
++            [sys.executable, "-m", "dotenv", "--file", str(dotenv_path), *args],
++            capture_output=True,
++            text=True,
++            encoding="utf-8",
++            env=env,
++        )
++
++    set_result = run("set", "GREETING", "你好")
++    assert set_result.returncode == 0, set_result.stderr
++    assert dotenv_path.read_bytes() == "GREETING='你好'\n".encode()
++
++    get_result = run("get", "GREETING")
++    assert get_result.returncode == 0, get_result.stderr
++    assert get_result.stdout == "你好\n"
++
++
++def test_list_reports_undecodable_file_without_a_traceback(cli, dotenv_path):
++    dotenv_path.write_bytes(b"A=\xff\xfe\n")
++
++    result = cli.invoke(dotenv_cli, ["--file", dotenv_path, "list"])
++
++    assert result.exit_code == 2
++    assert "Error decoding env file" in result.output
++    assert "Traceback" not in result.output
++
++
++def test_set_rejects_key_the_parser_cannot_read_back(cli, dotenv_path):
++    """
++    `dotenv set` must not report success for a key that would be stored as a
++    different variable.
++    """
++    dotenv_path.write_bytes(b"BASE=1\n")
++
++    result = cli.invoke(dotenv_cli, ["--file", dotenv_path, "set", "A B", "v"])
++
++    assert result.exit_code != 0
++    assert dotenv_path.read_bytes() == b"BASE=1\n"
+diff --git a/tests/test_main.py b/tests/test_main.py
+index 930ab17..54d0326 100644
+--- a/tests/test_main.py
++++ b/tests/test_main.py
+@@ -948,3 +948,235 @@ def test_dotenv_values_empty_value_with_inline_comment(string, expected):
+     result = dotenv.dotenv_values(stream=io.StringIO(string))
+ 
+     assert result == expected
++
++
++@pytest.mark.parametrize(
++    "before,expected",
++    [
++        # A file with no terminator at the end follows its last complete line.
++        ("A=1\r\nB=2", "A=1\r\nB=2\r\nC='9'\r\n"),
++        # A mixed file keeps each line's own terminator, and the appended line
++        # follows the line it is attached to (the last one), not the first.
++        ("A=1\r\nB=2\nC=3\r", "A=1\r\nB=2\nC=3\rD='9'\r"),
++        ("A=1\nB=2\r\n", "A=1\nB=2\r\nC='9'\r\n"),
++    ],
++    ids=["no-final-terminator-crlf", "mixed", "mixed-ending-crlf"],
++)
++def test_set_key_appends_with_the_last_line_terminator(dotenv_path, before, expected):
++    dotenv_path.write_bytes(before.encode())
++
++    key = "D" if before.endswith("\r") and "\r\n" in before else "C"
++    dotenv.set_key(dotenv_path, key, "9")
++
++    assert dotenv_path.read_bytes() == expected.encode()
++
++
++@pytest.mark.parametrize(
++    "before,expected",
++    [
++        ("A=1\nB=2\n", "A=1\nB=2\nC='9'\n"),
++        ("A=1\r\nB=2\r\n", "A=1\r\nB=2\r\nC='9'\r\n"),
++        ("A=1\rB=2\r", "A=1\rB=2\rC='9'\r"),
++    ],
++    ids=["LF", "CRLF", "CR"],
++)
++def test_set_key_preserves_line_endings(dotenv_path, before, expected):
++    """
++    Rewriting a file must not convert the line endings it did not touch.
++
++    `open()` defaults to universal-newline mode, which turned CRLF and CR into
++    "\n" on read and every "\n" into `os.linesep` on write: on Windows a
++    pure-LF file came back fully CRLF, on Linux a CRLF file came back fully LF.
++    The new line also has to follow its neighbours, or a CRLF file ends up with
++    a stray LF in the middle.
++    """
++    dotenv_path.write_bytes(before.encode())
++
++    dotenv.set_key(dotenv_path, "C", "9")
++
++    assert dotenv_path.read_bytes() == expected.encode()
++    assert dotenv.dotenv_values(dotenv_path) == {"A": "1", "B": "2", "C": "9"}
++
++
++def test_set_key_preserves_bom(dotenv_path):
++    """
++    The parser strips a leading BOM so the first key is readable, but the BOM
++    never reaches `Binding.original.string`, so the rewrite dropped it.
++    """
++    dotenv_path.write_bytes(b"\xef\xbb\xbfA=1\nB=2\n")
++
++    dotenv.set_key(dotenv_path, "C", "9")
++
++    assert dotenv_path.read_bytes() == b"\xef\xbb\xbfA=1\nB=2\nC='9'\n"
++
++
++def test_unset_key_preserves_bom(dotenv_path):
++    dotenv_path.write_bytes(b"\xef\xbb\xbfA=1\nB=2\n")
++
++    dotenv.unset_key(dotenv_path, "A")
++
++    assert dotenv_path.read_bytes() == b"\xef\xbb\xbfB=2\n"
++
++
++def test_unset_key_keeps_bom_when_key_is_missing(dotenv_path):
++    dotenv_path.write_bytes(b"\xef\xbb\xbfA=1\n")
++
++    result = dotenv.unset_key(dotenv_path, "MISSING")
++
++    assert result == (None, "MISSING")
++    assert dotenv_path.read_bytes() == b"\xef\xbb\xbfA=1\n"
++
++
++@pytest.mark.parametrize("newline", ["\n", "\r\n"])
++def test_unset_key_does_not_glue_lines_after_invalid_statement(dotenv_path, newline):
++    """
++    Removing a key that follows a malformed statement must not delete the
++    malformed statement's newline along with it.
++    """
++    dotenv_path.write_bytes(
++        newline.join(["A=1", "=bad", "TARGET=2", "C=3"]).encode() + newline.encode()
++    )
++
++    with mock.patch.object(logging.getLogger("dotenv.main"), "warning"):
++        result = dotenv.unset_key(dotenv_path, "TARGET")
++
++    assert result == (True, "TARGET")
++    assert (
++        dotenv_path.read_bytes()
++        == (newline.join(["A=1", "=bad", "C=3"]) + newline).encode()
++    )
++    assert dotenv.dotenv_values(dotenv_path) == {"A": "1", "C": "3"}
++
++
++@pytest.mark.parametrize(
++    "value",
++    ["a\rb", "a\r\nb", "a\rb\r\nc", "\r", "\r\n"],
++    ids=["CR", "CRLF", "mixed", "lone-CR", "lone-CRLF"],
++)
++def test_set_key_round_trips_carriage_returns(dotenv_path, value):
++    """
++    A carriage return inside a value used to be rewritten to "\n" on read, so
++    a value written by `set_key` did not come back unchanged.
++    """
++    dotenv.set_key(dotenv_path, "K", value)
++
++    assert dotenv.get_key(dotenv_path, "K") == value
++
++
++@pytest.mark.parametrize(
++    "key",
++    ["A B", "A=B", "A#B", "'A'", "A'", "A\nB", " A", "A\tB", ""],
++    ids=[
++        "space",
++        "equals",
++        "hash",
++        "quoted",
++        "trailing-quote",
++        "newline",
++        "leading-space",
++        "tab",
++        "empty",
++    ],
++)
++def test_set_key_rejects_unwritable_key(dotenv_path, key):
++    """
++    A key is interpolated into the line unquoted, so a key the parser reads
++    back as something else used to be stored as a different variable while
++    `set_key` reported success.
++    """
++    dotenv_path.write_bytes(b"BASE=1\n")
++
++    with pytest.raises(ValueError):
++        dotenv.set_key(dotenv_path, key, "v")
++
++    assert dotenv_path.read_bytes() == b"BASE=1\n"
++
++
++@pytest.mark.parametrize("key", ["A-B", "A.B", "中文键", "1", "_x", "A_B"])
++def test_set_key_accepts_writable_key(dotenv_path, key):
++    result = dotenv.set_key(dotenv_path, key, "v")
++
++    assert result == (True, key, "v")
++    assert dotenv.dotenv_values(dotenv_path) == {key: "v"}
++
++
++@pytest.mark.parametrize(
++    "content,expected",
++    [
++        # Only bare declarations: nothing is set, so the documented contract
++        # ("True if at least one environment variable is set") is not met.
++        ("A\nB\n", False),
++        ("", False),
++        ("# comment only\n", False),
++        # `KEY=` sets an empty value, which counts.
++        ("A\nB=\n", True),
++        ("A=1\n", True),
++    ],
++    ids=["bare-only", "empty-file", "comment-only", "bare-plus-empty", "value"],
++)
++def test_load_dotenv_return_value_means_a_variable_was_set(
++    dotenv_path, content, expected
++):
++    dotenv_path.write_text(content)
++
++    with mock.patch.dict(os.environ, {}, clear=True):
++        result = dotenv.load_dotenv(dotenv_path)
++
++        assert result is expected
++        assert os.environ == (
++            {"B": ""}
++            if content == "A\nB=\n"
++            else {"A": "1"}
++            if content == "A=1\n"
++            else {}
++        )
++
++
++def test_bare_declaration_does_not_mask_the_environment_in_expansion():
++    """
++    A bare `NAME` line parses to `None`. Putting that `None` into the mapping
++    used for expansion hid the real environment value, so `${NAME}` expanded to
++    "" instead of the value from the environment.
++    """
++    with mock.patch.dict(os.environ, {"MASKVAR": "fromenv"}, clear=True):
++        result = dotenv.dotenv_values(stream=io.StringIO("MASKVAR\nB=${MASKVAR}\n"))
++
++        assert result == {"MASKVAR": None, "B": "fromenv"}
++
++
++@pytest.mark.parametrize(
++    "string,expected",
++    [
++        # `:-` uses the default when the variable is set but empty (POSIX).
++        ("b=\na=${b:-d}", {"b": "", "a": "d"}),
++        ("b\na=${b:-d}", {"b": None, "a": "d"}),
++        # "0" is a real value.
++        ("b=0\na=${b:-d}", {"b": "0", "a": "0"}),
++        ("b=c\na=${b:-d}", {"b": "c", "a": "c"}),
++        # `${b}` without a default still expands to the empty value.
++        ("b=\na=${b}", {"b": "", "a": ""}),
++    ],
++)
++def test_dotenv_values_uses_default_for_empty_values(string, expected):
++    with mock.patch.dict(os.environ, {}, clear=True):
++        assert dotenv.dotenv_values(stream=io.StringIO(string)) == expected
++
++
++@pytest.mark.parametrize(
++    "content,key,expected",
++    [
++        ('A="l1\r\nl2"\r\nB=2\r\n', "A", "l1\r\nl2"),
++        ("A='l1\rl2'\r\nB=2\r\n", "A", "l1\rl2"),
++        ("A=1\r\nB=2\r\n", "B", "2"),
++    ],
++    ids=["crlf-in-double-quotes", "cr-in-single-quotes", "plain-crlf"],
++)
++def test_dotenv_values_preserves_carriage_returns(dotenv_path, content, key, expected):
++    """
++    Reading a path must agree with reading the same bytes from a stream;
++    universal-newline mode used to flatten a CR inside a value to "\n".
++    """
++    dotenv_path.write_bytes(content.encode())
++
++    assert dotenv.dotenv_values(dotenv_path)[key] == expected
++    assert dotenv.dotenv_values(stream=io.StringIO(content))[key] == expected
+diff --git a/tests/test_parser.py b/tests/test_parser.py
+index 667eae1..8f6c6cd 100644
+--- a/tests/test_parser.py
++++ b/tests/test_parser.py
+@@ -721,3 +721,42 @@ def test_parse_stream(test_input, expected):
+     result = parse_stream(io.StringIO(test_input))
+ 
+     assert list(result) == expected
++
++
++@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
++def test_parse_stream_recovers_whole_line_on_invalid_statement(newline):
++    """
++    After a malformed statement the parser must consume the *entire* line
++    terminator, and keep the line count in sync with the real file.
++
++    With CRLF input, `_rest_of_line` used to match only the `\r` and leave the
++    `\n` to be attributed to the next binding. That shifted every later
++    reported line number by one and, because `set_key`/`unset_key` echo
++    `Binding.original.string` back out, deleting the following statement also
++    deleted its newline and glued two lines together.
++    """
++    text = newline.join(["a=1", "=bad", "b=2", "a: bad", "c=3"]) + newline
++
++    bindings = list(parse_stream(io.StringIO(text)))
++
++    assert [(b.key, b.error, b.original.line) for b in bindings] == [
++        ("a", False, 1),
++        (None, True, 2),
++        ("b", False, 3),
++        (None, True, 4),
++        ("c", False, 5),
++    ]
++    # Every binding owns a complete terminator, so echoing the untouched ones
++    # back cannot merge lines.
++    for binding in bindings:
++        assert binding.original.string.endswith(newline)
++
++
++@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
++def test_parse_stream_crlf_is_a_single_line_break(newline):
++    text = newline.join(["a=1", "b=2", "c=3"]) + newline
++
++    bindings = list(parse_stream(io.StringIO(text)))
++
++    assert [b.original.line for b in bindings] == [1, 2, 3]
++    assert [b.value for b in bindings] == ["1", "2", "3"]
+diff --git a/tests/test_variables.py b/tests/test_variables.py
+index 6f2b220..ff15360 100644
+--- a/tests/test_variables.py
++++ b/tests/test_variables.py
+@@ -33,3 +33,78 @@ def test_parse_variables(value, expected):
+     result = parse_variables(value)
+ 
+     assert list(result) == expected
++
++
++@pytest.mark.parametrize(
++    "env,default,expected",
++    [
++        # `${name:-default}` uses the default when the name is unset or null.
++        ({}, "d", "d"),
++        ({"b": ""}, "d", "d"),
++        ({"b": None}, "d", "d"),
++        ({"b": "c"}, "d", "c"),
++        # "0" is a real value, not null (only the empty string is null for `:-`).
++        ({"b": "0"}, "d", "0"),
++        # `${name}` has no default, so those cases stay empty.
++        ({}, None, ""),
++        ({"b": ""}, None, ""),
++        ({"b": "0"}, None, "0"),
++    ],
++)
++def test_variable_resolve_default_semantics(env, default, expected):
++    assert Variable(name="b", default=default).resolve(env) == expected
++
++
++@pytest.mark.parametrize(
++    "value,expected",
++    [
++        # A run of `${` with no closing brace must not be an expansion.
++        ("${" * 4, [Literal(value="${" * 4)]),
++        # `:-` only counts right after the first colon.
++        ("${a:b}", [Literal(value="${a:b}")]),
++        ("${a::b}", [Literal(value="${a::b}")]),
++        # `[^}:]*` stops at the first colon, and a `:` that is not part of
++        # `:-` makes the whole candidate invalid, so these stay literal.
++        ("${:}", [Literal(value="${:}")]),
++        ("${a:-}", [Variable(name="a", default="")]),
++        # A `$` *is* allowed inside a name; only `:` and `}` end it. The
++        # expected atoms below are the ones the original implementation
++        # produces (measured, not assumed).
++        (
++            "${a${b}}",
++            [Variable(name="a${b", default=None), Literal(value="}")],
++        ),
++        ("${a$b}", [Variable(name="a$b", default=None)]),
++    ],
++)
++def test_parse_variables_edge_shapes(value, expected):
++    assert list(parse_variables(value)) == expected
++
++
++def test_parse_variables_is_linear_on_unterminated_expansions():
++    """
++    A value made of many `${` and no `}` at all used to be quadratic: the
++    greedy name group swallowed the whole tail and then backtracked one
++    character at a time at every start position. 16 KB took ~1.8 s and 32 KB
++    ~7.7 s, so a truncated or hostile `.env` value could stall `load_dotenv`.
++
++    The assertion is structural rather than a wall-clock threshold: a linear
++    scan visits each `${` once and finds no closing brace in O(n).
++    """
++    import time
++
++    small = "${" * 4000  # 8 KB
++    large = "${" * 16000  # 32 KB
++
++    start = time.perf_counter()
++    assert list(parse_variables(small)) == [Literal(value=small)]
++    small_elapsed = time.perf_counter() - start
++
++    start = time.perf_counter()
++    assert list(parse_variables(large)) == [Literal(value=large)]
++    large_elapsed = time.perf_counter() - start
++
++    # Quadratic behaviour made the 4x larger input ~16x slower; a linear scan
++    # stays well under a 10x ratio even with timer noise.
++    assert large_elapsed < small_elapsed * 10 + 0.05
++    assert large_elapsed < 0.5

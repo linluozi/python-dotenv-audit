@@ -1,0 +1,1182 @@
+import io
+import logging
+import os
+import pathlib
+import stat
+import subprocess
+import sys
+import textwrap
+from unittest import mock
+
+import pytest
+
+import dotenv
+from dotenv.main import DotEnv
+
+
+def test_set_key_no_file(tmp_path):
+    nx_path = tmp_path / "nx"
+    logger = logging.getLogger("dotenv.main")
+
+    with mock.patch.object(logger, "warning"):
+        result = dotenv.set_key(nx_path, "foo", "bar")
+
+    assert result == (True, "foo", "bar")
+    assert nx_path.exists()
+
+
+@pytest.mark.parametrize(
+    "before,key,value,expected,after",
+    [
+        ("", "a", "", (True, "a", ""), "a=''\n"),
+        ("", "a", "b", (True, "a", "b"), "a='b'\n"),
+        ("", "a", "'b'", (True, "a", "'b'"), "a='\\'b\\''\n"),
+        ("", "a", '"b"', (True, "a", '"b"'), "a='\"b\"'\n"),
+        ("", "a", "b'c", (True, "a", "b'c"), "a='b\\'c'\n"),
+        ("", "a", 'b"c', (True, "a", 'b"c'), "a='b\"c'\n"),
+        ("a=b", "a", "c", (True, "a", "c"), "a='c'\n"),
+        ("a=b\n", "a", "c", (True, "a", "c"), "a='c'\n"),
+        ("a=b\n\n", "a", "c", (True, "a", "c"), "a='c'\n\n"),
+        ("a=b\nc=d", "a", "e", (True, "a", "e"), "a='e'\nc=d"),
+        ("a=b\nc=d\ne=f", "c", "g", (True, "c", "g"), "a=b\nc='g'\ne=f"),
+        ("a=b\n", "c", "d", (True, "c", "d"), "a=b\nc='d'\n"),
+        ("a=b", "c", "d", (True, "c", "d"), "a=b\nc='d'\n"),
+        ("", "a", "b\\c", (True, "a", "b\\c"), "a='b\\\\c'\n"),
+        ("", "a", "b\\", (True, "a", "b\\"), "a='b\\\\'\n"),
+        ("", "a", "b\\'c", (True, "a", "b\\'c"), "a='b\\\\\\'c'\n"),
+    ],
+)
+def test_set_key(dotenv_path, before, key, value, expected, after):
+    logger = logging.getLogger("dotenv.main")
+    dotenv_path.write_text(before)
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.set_key(dotenv_path, key, value)
+
+    assert result == expected
+    assert dotenv_path.read_text() == after
+    mock_warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:\\Users",
+        "C:\\Users\\",
+        "\\d+",
+        "back\\",
+        "a\\'b",
+        "it's",
+        'say "hi"',
+        "a\\nb",
+        "plain",
+        "",
+    ],
+)
+def test_set_key_round_trips(dotenv_path, value):
+    dotenv_path.write_text("")
+
+    dotenv.set_key(dotenv_path, "a", value)
+    dotenv.set_key(dotenv_path, "b", "sentinel")
+
+    assert dotenv.get_key(dotenv_path, "a") == value
+    # A value that is mis-tokenized can swallow the lines that follow it.
+    assert dotenv.get_key(dotenv_path, "b") == "sentinel"
+
+
+def test_set_key_encoding(dotenv_path):
+    encoding = "latin-1"
+
+    result = dotenv.set_key(dotenv_path, "a", "é", encoding=encoding)
+
+    assert result == (True, "a", "é")
+    assert dotenv_path.read_text(encoding=encoding) == "a='é'\n"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="file mode bits behave differently on Windows"
+)
+def test_set_key_preserves_file_mode(dotenv_path):
+    dotenv_path.write_text("a=x\n")
+    dotenv_path.chmod(0o640)
+    mode_before = stat.S_IMODE(dotenv_path.stat().st_mode)
+
+    dotenv.set_key(dotenv_path, "a", "y")
+
+    mode_after = stat.S_IMODE(dotenv_path.stat().st_mode)
+    assert mode_before == mode_after
+
+
+def test_rewrite_closes_file_handle_on_lstat_failure(tmp_path):
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text("a=x\n")
+    real_open = open
+    opened_handles = []
+
+    def tracking_open(*args, **kwargs):
+        handle = real_open(*args, **kwargs)
+        opened_handles.append(handle)
+        return handle
+
+    with mock.patch("dotenv.main.os.lstat", side_effect=FileNotFoundError):
+        with mock.patch("dotenv.main.open", side_effect=tracking_open):
+            dotenv.set_key(dotenv_path, "a", "x")
+
+    assert opened_handles, "expected at least one file to be opened"
+    assert all(handle.closed for handle in opened_handles)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
+def test_set_key_symlink_to_existing_file(tmp_path):
+    target = tmp_path / "target.env"
+    target.write_text("a=x\n")
+    symlink = tmp_path / ".env"
+    symlink.symlink_to(target)
+
+    dotenv.set_key(symlink, "a", "y")
+
+    assert target.read_text() == "a=x\n"
+    assert not symlink.is_symlink()
+    assert "a='y'" in symlink.read_text()
+    assert stat.S_IMODE(symlink.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
+def test_set_key_symlink_to_missing_file(tmp_path):
+    target = tmp_path / "nx"
+    symlink = tmp_path / ".env"
+    symlink.symlink_to(target)
+
+    dotenv.set_key(symlink, "a", "x")
+
+    assert not target.exists()
+    assert not symlink.is_symlink()
+    assert symlink.read_text() == "a='x'\n"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
+def test_set_key_follow_symlinks(tmp_path):
+    target = tmp_path / "target.env"
+    target.write_text("a=x\n")
+    symlink = tmp_path / ".env"
+    symlink.symlink_to(target)
+
+    dotenv.set_key(symlink, "a", "y", follow_symlinks=True)
+
+    assert target.read_text() == "a='y'\n"
+    assert symlink.is_symlink()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and os.geteuid() == 0,
+    reason="Root user can access files even with 000 permissions.",
+)
+def test_set_key_permission_error(dotenv_path):
+    if sys.platform == "win32":
+        # On Windows, make file read-only
+        dotenv_path.chmod(stat.S_IREAD)
+    else:
+        # On Unix, remove all permissions
+        dotenv_path.chmod(0o000)
+
+    with pytest.raises(PermissionError):
+        dotenv.set_key(dotenv_path, "a", "b")
+
+    # Restore permissions
+    if sys.platform == "win32":
+        dotenv_path.chmod(stat.S_IWRITE | stat.S_IREAD)
+    else:
+        dotenv_path.chmod(0o600)
+    assert dotenv_path.read_text() == ""
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and os.geteuid() == 0,
+    reason="Root user can access files even with 000 permissions.",
+)
+def test_set_key_permission_error_leaves_no_temp_file(dotenv_path):
+    if sys.platform == "win32":
+        # On Windows, make file read-only
+        dotenv_path.chmod(stat.S_IREAD)
+    else:
+        # On Unix, remove all permissions
+        dotenv_path.chmod(0o000)
+
+    try:
+        with pytest.raises(PermissionError):
+            dotenv.set_key(dotenv_path, "a", "b")
+
+        assert list(dotenv_path.parent.glob(".tmp_*")) == []
+    finally:
+        # Restore permissions
+        if sys.platform == "win32":
+            dotenv_path.chmod(stat.S_IWRITE | stat.S_IREAD)
+        else:
+            dotenv_path.chmod(0o600)
+
+
+def test_rewrite_reports_original_error_when_cleanup_fails(dotenv_path, caplog):
+    replace_error = OSError("replace failed")
+
+    with mock.patch("dotenv.main.os.replace", side_effect=replace_error):
+        with mock.patch.object(
+            pathlib.Path, "unlink", side_effect=OSError("unlink failed")
+        ):
+            with pytest.raises(OSError) as excinfo:
+                dotenv.set_key(dotenv_path, "a", "b")
+
+    assert excinfo.value is replace_error
+    [temp_file] = dotenv_path.parent.glob(".tmp_*")
+    assert caplog.messages == [
+        f"python-dotenv could not remove the temporary file {temp_file}"
+    ]
+
+
+def test_set_key_missing_directory(tmp_path):
+    dotenv_path = tmp_path / "nx_dir" / ".env"
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        dotenv.set_key(dotenv_path, "a", "b")
+
+    assert exc_info.value.filename == str(dotenv_path)
+    assert not dotenv_path.parent.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="Directory permissions are not enforced on Windows or for root.",
+)
+def test_set_key_read_only_directory(tmp_path):
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    dotenv_path = directory / ".env"
+    dotenv_path.write_text("a=x\n")
+    directory.chmod(0o555)
+
+    try:
+        with pytest.raises(PermissionError) as exc_info:
+            dotenv.set_key(dotenv_path, "a", "y")
+    finally:
+        directory.chmod(0o755)
+
+    assert exc_info.value.filename == str(dotenv_path)
+    assert dotenv_path.read_text() == "a=x\n"
+    assert list(directory.iterdir()) == [dotenv_path]
+
+
+def windows_read_only_semantics(path):
+    # On Windows, a file without the owner-write bit can't be replaced or deleted.
+    return path.exists() and not path.stat().st_mode & stat.S_IWUSR
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        lambda path: dotenv.set_key(path, "a", "y"),
+        lambda path: dotenv.unset_key(path, "a"),
+    ],
+    ids=["set_key", "unset_key"],
+)
+def test_rewrite_read_only_file_leaves_no_temp_file(tmp_path, rewrite):
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text("a=x\n")
+    dotenv_path.chmod(stat.S_IREAD)
+    real_replace = os.replace
+    real_unlink = pathlib.Path.unlink
+
+    def replace(src, dst):
+        if windows_read_only_semantics(pathlib.Path(dst)):
+            raise PermissionError(
+                13, "Access is denied", os.fspath(src), None, os.fspath(dst)
+            )
+        real_replace(src, dst)
+
+    def unlink(self, missing_ok=False):
+        if windows_read_only_semantics(self):
+            raise PermissionError(13, "Access is denied", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    with mock.patch("dotenv.main.os.replace", side_effect=replace):
+        with mock.patch.object(pathlib.Path, "unlink", unlink):
+            with pytest.raises(PermissionError) as exc_info:
+                rewrite(dotenv_path)
+
+    dotenv_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    assert exc_info.value.filename2 == str(dotenv_path)
+    assert dotenv_path.read_text() == "a=x\n"
+    assert list(tmp_path.iterdir()) == [dotenv_path]
+
+
+@pytest.mark.parametrize("path_type", [str, pathlib.Path])
+@pytest.mark.parametrize(
+    "call,expected_result,expected_content",
+    [
+        (lambda path: dotenv.dotenv_values(path), {"a": "x"}, "a=x\n"),
+        (lambda path: dotenv.get_key(path, "a"), "x", "a=x\n"),
+        (lambda path: dotenv.set_key(path, "b", "y"), (True, "b", "y"), "a=x\nb='y'\n"),
+        (lambda path: dotenv.unset_key(path, "a"), (True, "a"), ""),
+    ],
+    ids=["dotenv_values", "get_key", "set_key", "unset_key"],
+)
+def test_dotenv_path_expands_user(
+    tmp_path, monkeypatch, path_type, call, expected_result, expected_content
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("a=x\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    result = call(path_type("~/.env"))
+
+    assert result == expected_result
+    assert (home / ".env").read_text() == expected_content
+    assert sorted(tmp_path.iterdir()) == [home]
+
+
+@mock.patch.dict(os.environ, {}, clear=True)
+def test_load_dotenv_expands_user(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("a=x\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    result = dotenv.load_dotenv("~/.env")
+
+    assert result is True
+    assert os.environ["a"] == "x"
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("~/.env", "{home}/.env"),
+        (pathlib.Path("~/.env"), pathlib.Path("{home}/.env")),
+        (".env", ".env"),
+        (None, None),
+    ],
+)
+def test_dotenv_path_keeps_type(tmp_path, monkeypatch, path, expected):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    if expected is not None:
+        expected = type(expected)(str(expected).format(home=tmp_path))
+
+    result = DotEnv(path).dotenv_path
+
+    assert result == expected
+    assert type(result) is type(expected)
+
+
+def test_get_key_no_file(tmp_path):
+    nx_path = tmp_path / "nx"
+    logger = logging.getLogger("dotenv.main")
+
+    with (
+        mock.patch.object(logger, "info") as mock_info,
+        mock.patch.object(logger, "warning") as mock_warning,
+    ):
+        result = dotenv.get_key(nx_path, "foo")
+
+    assert result is None
+    mock_info.assert_has_calls(
+        calls=[
+            mock.call("python-dotenv could not find configuration file %s.", nx_path)
+        ],
+    )
+    mock_warning.assert_has_calls(
+        calls=[mock.call("Key %s not found in %s.", "foo", nx_path)],
+    )
+
+
+def test_get_key_not_found(dotenv_path):
+    logger = logging.getLogger("dotenv.main")
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.get_key(dotenv_path, "foo")
+
+    assert result is None
+    mock_warning.assert_called_once_with("Key %s not found in %s.", "foo", dotenv_path)
+
+
+def test_get_key_ok(dotenv_path):
+    logger = logging.getLogger("dotenv.main")
+    dotenv_path.write_text("foo=bar")
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.get_key(dotenv_path, "foo")
+
+    assert result == "bar"
+    mock_warning.assert_not_called()
+
+
+def test_get_key_encoding(dotenv_path):
+    encoding = "latin-1"
+    dotenv_path.write_text("é=è", encoding=encoding)
+
+    result = dotenv.get_key(dotenv_path, "é", encoding=encoding)
+
+    assert result == "è"
+
+
+def test_get_key_none(dotenv_path):
+    logger = logging.getLogger("dotenv.main")
+    dotenv_path.write_text("foo")
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.get_key(dotenv_path, "foo")
+
+    assert result is None
+    mock_warning.assert_not_called()
+
+
+def test_empty_dotenv_dict_is_cached(tmp_path):
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text("")
+    dotenv_obj = DotEnv(dotenv_path)
+
+    with mock.patch.object(dotenv_obj, "parse", wraps=dotenv_obj.parse) as mock_parse:
+        assert dotenv_obj.dict() == {}
+        assert dotenv_obj.dict() == {}
+
+    assert mock_parse.call_count == 1
+
+
+def test_unset_with_value(dotenv_path):
+    logger = logging.getLogger("dotenv.main")
+    dotenv_path.write_text("a=b\nc=d")
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.unset_key(dotenv_path, "a")
+
+    assert result == (True, "a")
+    assert dotenv_path.read_text() == "c=d"
+    mock_warning.assert_not_called()
+
+
+def test_unset_no_value(dotenv_path):
+    logger = logging.getLogger("dotenv.main")
+    dotenv_path.write_text("foo")
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.unset_key(dotenv_path, "foo")
+
+    assert result == (True, "foo")
+    assert dotenv_path.read_text() == ""
+    mock_warning.assert_not_called()
+
+
+def test_unset_encoding(dotenv_path):
+    encoding = "latin-1"
+    dotenv_path.write_text("é=x", encoding=encoding)
+
+    result = dotenv.unset_key(dotenv_path, "é", encoding=encoding)
+
+    assert result == (True, "é")
+    assert dotenv_path.read_text(encoding=encoding) == ""
+
+
+def test_unset_non_existent_file(tmp_path):
+    nx_path = tmp_path / "nx"
+    logger = logging.getLogger("dotenv.main")
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.unset_key(nx_path, "foo")
+
+    assert result == (None, "foo")
+    mock_warning.assert_called_once_with(
+        "Can't delete from %s - it doesn't exist.",
+        nx_path,
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
+def test_unset_key_symlink_to_existing_file(tmp_path):
+    target = tmp_path / "target.env"
+    target.write_text("a=x\n")
+    symlink = tmp_path / ".env"
+    symlink.symlink_to(target)
+
+    dotenv.unset_key(symlink, "a")
+
+    assert target.read_text() == "a=x\n"
+    assert not symlink.is_symlink()
+    assert symlink.read_text() == ""
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
+def test_unset_key_symlink_to_missing_file(tmp_path):
+    target = tmp_path / "nx"
+    symlink = tmp_path / ".env"
+    symlink.symlink_to(target)
+    logger = logging.getLogger("dotenv.main")
+
+    with mock.patch.object(logger, "warning") as mock_warning:
+        result = dotenv.unset_key(symlink, "a")
+
+    assert result == (None, "a")
+    assert symlink.is_symlink()
+    mock_warning.assert_called_once()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
+def test_unset_key_follow_symlinks(tmp_path):
+    target = tmp_path / "target.env"
+    target.write_text("a=b\n")
+    symlink = tmp_path / ".env"
+    symlink.symlink_to(target)
+
+    dotenv.unset_key(symlink, "a", follow_symlinks=True)
+
+    assert target.read_text() == ""
+    assert symlink.is_symlink()
+
+
+def prepare_file_hierarchy(path):
+    """
+    Create a temporary folder structure like the following:
+
+        test_find_dotenv0/
+        └── child1
+            ├── child2
+            │   └── child3
+            │       └── child4
+            └── .env
+
+    Then try to automatically `find_dotenv` starting in `child4`
+    """
+
+    leaf = path / "child1" / "child2" / "child3" / "child4"
+    leaf.mkdir(parents=True, exist_ok=True)
+    return leaf
+
+
+def test_find_dotenv_no_file_raise(tmp_path):
+    leaf = prepare_file_hierarchy(tmp_path)
+    os.chdir(leaf)
+
+    with pytest.raises(IOError):
+        dotenv.find_dotenv(raise_error_if_not_found=True, usecwd=True)
+
+
+def test_find_dotenv_no_file_no_raise(tmp_path):
+    leaf = prepare_file_hierarchy(tmp_path)
+    os.chdir(leaf)
+
+    result = dotenv.find_dotenv(usecwd=True)
+
+    assert result == ""
+
+
+def test_find_dotenv_found(tmp_path):
+    leaf = prepare_file_hierarchy(tmp_path)
+    os.chdir(leaf)
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_bytes(b"TEST=test\n")
+
+    result = dotenv.find_dotenv(usecwd=True)
+
+    assert result == str(dotenv_path)
+
+
+def test_find_dotenv_expands_user(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("a=x\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    result = dotenv.find_dotenv("~/.env", usecwd=True)
+
+    assert result == f"{home}/.env"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@mock.patch.dict(os.environ, {}, clear=True)
+def test_load_dotenv_existing_file(dotenv_path):
+    dotenv_path.write_text("a=b")
+
+    result = dotenv.load_dotenv(dotenv_path)
+
+    assert result is True
+    assert os.environ == {"a": "b"}
+
+
+@pytest.mark.parametrize(
+    "flag_value",
+    [
+        "true",
+        "yes",
+        "1",
+        "t",
+        "y",
+        "True",
+        "Yes",
+        "TRUE",
+        "YES",
+        "T",
+        "Y",
+    ],
+)
+def test_load_dotenv_disabled(dotenv_path, flag_value):
+    expected_environ = {"PYTHON_DOTENV_DISABLED": flag_value}
+    with mock.patch.dict(
+        os.environ, {"PYTHON_DOTENV_DISABLED": flag_value}, clear=True
+    ):
+        dotenv_path.write_text("a=b")
+
+        result = dotenv.load_dotenv(dotenv_path)
+
+        assert result is False
+        assert os.environ == expected_environ
+
+
+@pytest.mark.parametrize(
+    "flag_value",
+    [
+        "true",
+        "yes",
+        "1",
+        "t",
+        "y",
+        "True",
+        "Yes",
+        "TRUE",
+        "YES",
+        "T",
+        "Y",
+    ],
+)
+def test_load_dotenv_disabled_notification(dotenv_path, flag_value):
+    with mock.patch.dict(
+        os.environ, {"PYTHON_DOTENV_DISABLED": flag_value}, clear=True
+    ):
+        dotenv_path.write_text("a=b")
+
+        logger = logging.getLogger("dotenv.main")
+        with mock.patch.object(logger, "debug") as mock_debug:
+            result = dotenv.load_dotenv(dotenv_path)
+
+        assert result is False
+        mock_debug.assert_called_once_with(
+            "python-dotenv: .env loading disabled by PYTHON_DOTENV_DISABLED environment variable"
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@pytest.mark.parametrize(
+    "flag_value",
+    [
+        "",
+        "false",
+        "no",
+        "0",
+        "f",
+        "n",
+        "False",
+        "No",
+        "FALSE",
+        "NO",
+        "F",
+        "N",
+    ],
+)
+def test_load_dotenv_enabled(dotenv_path, flag_value):
+    expected_environ = {"PYTHON_DOTENV_DISABLED": flag_value, "a": "b"}
+    with mock.patch.dict(
+        os.environ, {"PYTHON_DOTENV_DISABLED": flag_value}, clear=True
+    ):
+        dotenv_path.write_text("a=b")
+
+        result = dotenv.load_dotenv(dotenv_path)
+
+        assert result is True
+        assert os.environ == expected_environ
+
+
+@pytest.mark.parametrize(
+    "flag_value",
+    [
+        "",
+        "false",
+        "no",
+        "0",
+        "f",
+        "n",
+        "False",
+        "No",
+        "FALSE",
+        "NO",
+        "F",
+        "N",
+    ],
+)
+def test_load_dotenv_enabled_no_notification(dotenv_path, flag_value):
+    with mock.patch.dict(
+        os.environ, {"PYTHON_DOTENV_DISABLED": flag_value}, clear=True
+    ):
+        dotenv_path.write_text("a=b")
+
+        logger = logging.getLogger("dotenv.main")
+        with mock.patch.object(logger, "debug") as mock_debug:
+            result = dotenv.load_dotenv(dotenv_path)
+
+        assert result is True
+        mock_debug.assert_not_called()
+
+
+@mock.patch.dict(os.environ, {}, clear=True)
+def test_load_dotenv_doesnt_disable_itself(dotenv_path):
+    dotenv_path.write_text("PYTHON_DOTENV_DISABLED=true")
+
+    result = dotenv.load_dotenv(dotenv_path)
+
+    assert result is True
+    assert os.environ == {"PYTHON_DOTENV_DISABLED": "true"}
+
+
+def test_load_dotenv_no_file_verbose():
+    logger = logging.getLogger("dotenv.main")
+
+    with mock.patch.object(logger, "info") as mock_info:
+        result = dotenv.load_dotenv(".does_not_exist", verbose=True)
+
+    assert result is False
+    mock_info.assert_called_once_with(
+        "python-dotenv could not find configuration file %s.", ".does_not_exist"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@mock.patch.dict(os.environ, {"a": "c"}, clear=True)
+def test_load_dotenv_existing_variable_no_override(dotenv_path):
+    dotenv_path.write_text("a=b")
+
+    result = dotenv.load_dotenv(dotenv_path, override=False)
+
+    assert result is True
+    assert os.environ == {"a": "c"}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@mock.patch.dict(os.environ, {"a": "c"}, clear=True)
+def test_load_dotenv_existing_variable_override(dotenv_path):
+    dotenv_path.write_text("a=b")
+
+    result = dotenv.load_dotenv(dotenv_path, override=True)
+
+    assert result is True
+    assert os.environ == {"a": "b"}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@mock.patch.dict(os.environ, {"a": "c"}, clear=True)
+def test_load_dotenv_redefine_var_used_in_file_no_override(dotenv_path):
+    dotenv_path.write_text('a=b\nd="${a}"')
+
+    result = dotenv.load_dotenv(dotenv_path)
+
+    assert result is True
+    assert os.environ == {"a": "c", "d": "c"}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@mock.patch.dict(os.environ, {"a": "c"}, clear=True)
+def test_load_dotenv_redefine_var_used_in_file_with_override(dotenv_path):
+    dotenv_path.write_text('a=b\nd="${a}"')
+
+    result = dotenv.load_dotenv(dotenv_path, override=True)
+
+    assert result is True
+    assert os.environ == {"a": "b", "d": "b"}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@mock.patch.dict(os.environ, {}, clear=True)
+def test_load_dotenv_string_io_utf_8():
+    stream = io.StringIO("a=à")
+
+    result = dotenv.load_dotenv(stream=stream)
+
+    assert result is True
+    assert os.environ == {"a": "à"}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@mock.patch.dict(os.environ, {}, clear=True)
+def test_load_dotenv_file_stream(dotenv_path):
+    dotenv_path.write_text("a=b")
+
+    with dotenv_path.open() as f:
+        result = dotenv.load_dotenv(stream=f)
+
+    assert result is True
+    assert os.environ == {"a": "b"}
+
+
+def test_load_dotenv_in_current_dir(tmp_path):
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_bytes(b"a=b")
+    code_path = tmp_path / "code.py"
+    code_path.write_text(
+        textwrap.dedent("""
+        import dotenv
+        import os
+
+        dotenv.load_dotenv(verbose=True)
+        print(os.environ['a'])
+    """)
+    )
+    os.chdir(tmp_path)
+
+    result = subprocess.run(
+        [sys.executable, str(code_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout == "b\n"
+
+
+def test_dotenv_values_file(dotenv_path):
+    dotenv_path.write_text("a=b")
+
+    result = dotenv.dotenv_values(dotenv_path)
+
+    assert result == {"a": "b"}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="This test assumes case-sensitive variable names"
+)
+@pytest.mark.parametrize(
+    "env,string,interpolate,expected",
+    [
+        # Defined in environment, with and without interpolation
+        ({"b": "c"}, "a=$b", False, {"a": "$b"}),
+        ({"b": "c"}, "a=$b", True, {"a": "$b"}),
+        ({"b": "c"}, "a=${b}", False, {"a": "${b}"}),
+        ({"b": "c"}, "a=${b}", True, {"a": "c"}),
+        ({"b": "c"}, "a=${b:-d}", False, {"a": "${b:-d}"}),
+        ({"b": "c"}, "a=${b:-d}", True, {"a": "c"}),
+        # Defined in file
+        ({}, "b=c\na=${b}", True, {"a": "c", "b": "c"}),
+        # Undefined
+        ({}, "a=${b}", True, {"a": ""}),
+        ({}, "a=${b:-d}", True, {"a": "d"}),
+        # With quotes
+        ({"b": "c"}, 'a="${b}"', True, {"a": "c"}),
+        ({"b": "c"}, "a='${b}'", True, {"a": "c"}),
+        # With surrounding text
+        ({"b": "c"}, "a=x${b}y", True, {"a": "xcy"}),
+        # Self-referential
+        ({"a": "b"}, "a=${a}", True, {"a": "b"}),
+        ({}, "a=${a}", True, {"a": ""}),
+        ({"a": "b"}, "a=${a:-c}", True, {"a": "b"}),
+        ({}, "a=${a:-c}", True, {"a": "c"}),
+        # Reused
+        ({"b": "c"}, "a=${b}${b}", True, {"a": "cc"}),
+        # Re-defined and used in file
+        ({"b": "c"}, "b=d\na=${b}", True, {"a": "d", "b": "d"}),
+        ({}, "a=b\na=c\nd=${a}", True, {"a": "c", "d": "c"}),
+        ({}, "a=b\nc=${a}\nd=e\nc=${d}", True, {"a": "b", "c": "e", "d": "e"}),
+    ],
+)
+def test_dotenv_values_string_io(env, string, interpolate, expected):
+    with mock.patch.dict(os.environ, env, clear=True):
+        stream = io.StringIO(string)
+        stream.seek(0)
+
+        result = dotenv.dotenv_values(stream=stream, interpolate=interpolate)
+
+        assert result == expected
+
+
+def test_dotenv_values_file_stream(dotenv_path):
+    dotenv_path.write_text("a=b")
+
+    with dotenv_path.open() as f:
+        result = dotenv.dotenv_values(stream=f)
+
+    assert result == {"a": "b"}
+
+
+@pytest.mark.parametrize(
+    "string,expected",
+    [
+        ("KEY= # comment", {"KEY": ""}),
+        ("KEY=  # comment", {"KEY": ""}),
+        ("KEY=val # comment", {"KEY": "val"}),
+        ("KEY=a#b", {"KEY": "a#b"}),
+        ("KEY=#novalue", {"KEY": "#novalue"}),
+        ("KEY=# # comment", {"KEY": "#"}),
+        ("KEY=\t# comment", {"KEY": ""}),
+        ("KEY= # comment\nOTHER=val", {"KEY": "", "OTHER": "val"}),
+    ],
+)
+def test_dotenv_values_empty_value_with_inline_comment(string, expected):
+    result = dotenv.dotenv_values(stream=io.StringIO(string))
+
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    "before,expected",
+    [
+        # A file with no terminator at the end follows its last complete line.
+        ("A=1\r\nB=2", "A=1\r\nB=2\r\nC='9'\r\n"),
+        # A mixed file keeps each line's own terminator, and the appended line
+        # follows the line it is attached to (the last one), not the first.
+        ("A=1\r\nB=2\nC=3\r", "A=1\r\nB=2\nC=3\rD='9'\r"),
+        ("A=1\nB=2\r\n", "A=1\nB=2\r\nC='9'\r\n"),
+    ],
+    ids=["no-final-terminator-crlf", "mixed", "mixed-ending-crlf"],
+)
+def test_set_key_appends_with_the_last_line_terminator(dotenv_path, before, expected):
+    dotenv_path.write_bytes(before.encode())
+
+    key = "D" if before.endswith("\r") and "\r\n" in before else "C"
+    dotenv.set_key(dotenv_path, key, "9")
+
+    assert dotenv_path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize(
+    "before,expected",
+    [
+        ("A=1\nB=2\n", "A=1\nB=2\nC='9'\n"),
+        ("A=1\r\nB=2\r\n", "A=1\r\nB=2\r\nC='9'\r\n"),
+        ("A=1\rB=2\r", "A=1\rB=2\rC='9'\r"),
+    ],
+    ids=["LF", "CRLF", "CR"],
+)
+def test_set_key_preserves_line_endings(dotenv_path, before, expected):
+    """
+    Rewriting a file must not convert the line endings it did not touch.
+
+    `open()` defaults to universal-newline mode, which turned CRLF and CR into
+    "\n" on read and every "\n" into `os.linesep` on write: on Windows a
+    pure-LF file came back fully CRLF, on Linux a CRLF file came back fully LF.
+    The new line also has to follow its neighbours, or a CRLF file ends up with
+    a stray LF in the middle.
+    """
+    dotenv_path.write_bytes(before.encode())
+
+    dotenv.set_key(dotenv_path, "C", "9")
+
+    assert dotenv_path.read_bytes() == expected.encode()
+    assert dotenv.dotenv_values(dotenv_path) == {"A": "1", "B": "2", "C": "9"}
+
+
+def test_set_key_preserves_bom(dotenv_path):
+    """
+    The parser strips a leading BOM so the first key is readable, but the BOM
+    never reaches `Binding.original.string`, so the rewrite dropped it.
+    """
+    dotenv_path.write_bytes(b"\xef\xbb\xbfA=1\nB=2\n")
+
+    dotenv.set_key(dotenv_path, "C", "9")
+
+    assert dotenv_path.read_bytes() == b"\xef\xbb\xbfA=1\nB=2\nC='9'\n"
+
+
+def test_unset_key_preserves_bom(dotenv_path):
+    dotenv_path.write_bytes(b"\xef\xbb\xbfA=1\nB=2\n")
+
+    dotenv.unset_key(dotenv_path, "A")
+
+    assert dotenv_path.read_bytes() == b"\xef\xbb\xbfB=2\n"
+
+
+def test_unset_key_keeps_bom_when_key_is_missing(dotenv_path):
+    dotenv_path.write_bytes(b"\xef\xbb\xbfA=1\n")
+
+    result = dotenv.unset_key(dotenv_path, "MISSING")
+
+    assert result == (None, "MISSING")
+    assert dotenv_path.read_bytes() == b"\xef\xbb\xbfA=1\n"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_unset_key_does_not_glue_lines_after_invalid_statement(dotenv_path, newline):
+    """
+    Removing a key that follows a malformed statement must not delete the
+    malformed statement's newline along with it.
+    """
+    dotenv_path.write_bytes(
+        newline.join(["A=1", "=bad", "TARGET=2", "C=3"]).encode() + newline.encode()
+    )
+
+    with mock.patch.object(logging.getLogger("dotenv.main"), "warning"):
+        result = dotenv.unset_key(dotenv_path, "TARGET")
+
+    assert result == (True, "TARGET")
+    assert (
+        dotenv_path.read_bytes()
+        == (newline.join(["A=1", "=bad", "C=3"]) + newline).encode()
+    )
+    assert dotenv.dotenv_values(dotenv_path) == {"A": "1", "C": "3"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["a\rb", "a\r\nb", "a\rb\r\nc", "\r", "\r\n"],
+    ids=["CR", "CRLF", "mixed", "lone-CR", "lone-CRLF"],
+)
+def test_set_key_round_trips_carriage_returns(dotenv_path, value):
+    """
+    A carriage return inside a value used to be rewritten to "\n" on read, so
+    a value written by `set_key` did not come back unchanged.
+    """
+    dotenv.set_key(dotenv_path, "K", value)
+
+    assert dotenv.get_key(dotenv_path, "K") == value
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["A B", "A=B", "A#B", "'A'", "A'", "A\nB", " A", "A\tB", ""],
+    ids=[
+        "space",
+        "equals",
+        "hash",
+        "quoted",
+        "trailing-quote",
+        "newline",
+        "leading-space",
+        "tab",
+        "empty",
+    ],
+)
+def test_set_key_rejects_unwritable_key(dotenv_path, key):
+    """
+    A key is interpolated into the line unquoted, so a key the parser reads
+    back as something else used to be stored as a different variable while
+    `set_key` reported success.
+    """
+    dotenv_path.write_bytes(b"BASE=1\n")
+
+    with pytest.raises(ValueError):
+        dotenv.set_key(dotenv_path, key, "v")
+
+    assert dotenv_path.read_bytes() == b"BASE=1\n"
+
+
+@pytest.mark.parametrize("key", ["A-B", "A.B", "中文键", "1", "_x", "A_B"])
+def test_set_key_accepts_writable_key(dotenv_path, key):
+    result = dotenv.set_key(dotenv_path, key, "v")
+
+    assert result == (True, key, "v")
+    assert dotenv.dotenv_values(dotenv_path) == {key: "v"}
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        # Only bare declarations: nothing is set, so the documented contract
+        # ("True if at least one environment variable is set") is not met.
+        ("A\nB\n", False),
+        ("", False),
+        ("# comment only\n", False),
+        # `KEY=` sets an empty value, which counts.
+        ("A\nB=\n", True),
+        ("A=1\n", True),
+    ],
+    ids=["bare-only", "empty-file", "comment-only", "bare-plus-empty", "value"],
+)
+def test_load_dotenv_return_value_means_a_variable_was_set(
+    dotenv_path, content, expected
+):
+    dotenv_path.write_text(content)
+
+    with mock.patch.dict(os.environ, {}, clear=True):
+        result = dotenv.load_dotenv(dotenv_path)
+
+        assert result is expected
+        assert os.environ == (
+            {"B": ""}
+            if content == "A\nB=\n"
+            else {"A": "1"}
+            if content == "A=1\n"
+            else {}
+        )
+
+
+def test_bare_declaration_does_not_mask_the_environment_in_expansion():
+    """
+    A bare `NAME` line parses to `None`. Putting that `None` into the mapping
+    used for expansion hid the real environment value, so `${NAME}` expanded to
+    "" instead of the value from the environment.
+    """
+    with mock.patch.dict(os.environ, {"MASKVAR": "fromenv"}, clear=True):
+        result = dotenv.dotenv_values(stream=io.StringIO("MASKVAR\nB=${MASKVAR}\n"))
+
+        assert result == {"MASKVAR": None, "B": "fromenv"}
+
+
+@pytest.mark.parametrize(
+    "string,expected",
+    [
+        # `:-` uses the default when the variable is set but empty (POSIX).
+        ("b=\na=${b:-d}", {"b": "", "a": "d"}),
+        ("b\na=${b:-d}", {"b": None, "a": "d"}),
+        # "0" is a real value.
+        ("b=0\na=${b:-d}", {"b": "0", "a": "0"}),
+        ("b=c\na=${b:-d}", {"b": "c", "a": "c"}),
+        # `${b}` without a default still expands to the empty value.
+        ("b=\na=${b}", {"b": "", "a": ""}),
+    ],
+)
+def test_dotenv_values_uses_default_for_empty_values(string, expected):
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert dotenv.dotenv_values(stream=io.StringIO(string)) == expected
+
+
+@pytest.mark.parametrize(
+    "content,key,expected",
+    [
+        ('A="l1\r\nl2"\r\nB=2\r\n', "A", "l1\r\nl2"),
+        ("A='l1\rl2'\r\nB=2\r\n", "A", "l1\rl2"),
+        ("A=1\r\nB=2\r\n", "B", "2"),
+    ],
+    ids=["crlf-in-double-quotes", "cr-in-single-quotes", "plain-crlf"],
+)
+def test_dotenv_values_preserves_carriage_returns(dotenv_path, content, key, expected):
+    """
+    Reading a path must agree with reading the same bytes from a stream;
+    universal-newline mode used to flatten a CR inside a value to "\n".
+    """
+    dotenv_path.write_bytes(content.encode())
+
+    assert dotenv.dotenv_values(dotenv_path)[key] == expected
+    assert dotenv.dotenv_values(stream=io.StringIO(content))[key] == expected

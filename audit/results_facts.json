@@ -1,0 +1,127 @@
+{
+  "baseline": {
+    "commit": "0b2880591780a426b0551436f47a17e7a76d954f",
+    "version": "1.2.4",
+    "counts": {
+      "passed": 235,
+      "skipped": 50
+    },
+    "summary": "235 passed, 50 skipped, 31 warnings in 8.37s"
+  },
+  "patched": {
+    "counts": {
+      "passed": 306,
+      "skipped": 50
+    },
+    "summary": "306 passed, 50 skipped, 34 warnings in 8.66s"
+  },
+  "new_tests": 71,
+  "regressions": [],
+  "env_failures": [],
+  "red_only": [
+    "tests/test_cli.py::test_cli_round_trips_non_ascii_under_a_gbk_process_locale",
+    "tests/test_cli.py::test_list_reports_undecodable_file_without_a_traceback",
+    "tests/test_cli.py::test_set_rejects_key_the_parser_cannot_read_back",
+    "tests/test_cli.py::test_stream_file_decodes_as_utf8",
+    "tests/test_main.py::test_bare_declaration_does_not_mask_the_environment_in_expansion",
+    "tests/test_main.py::test_dotenv_values_preserves_carriage_returns[cr-in-single-quotes]",
+    "tests/test_main.py::test_dotenv_values_preserves_carriage_returns[crlf-in-double-quotes]",
+    "tests/test_main.py::test_dotenv_values_uses_default_for_empty_values[b=\\na=${b:-d}-expected0]",
+    "tests/test_main.py::test_dotenv_values_uses_default_for_empty_values[b\\na=${b:-d}-expected1]",
+    "tests/test_main.py::test_load_dotenv_return_value_means_a_variable_was_set[bare-only]",
+    "tests/test_main.py::test_set_key_appends_with_the_last_line_terminator[mixed-ending-crlf]",
+    "tests/test_main.py::test_set_key_appends_with_the_last_line_terminator[mixed]",
+    "tests/test_main.py::test_set_key_preserves_bom",
+    "tests/test_main.py::test_set_key_preserves_line_endings[CR]",
+    "tests/test_main.py::test_set_key_preserves_line_endings[LF]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[empty]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[equals]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[hash]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[leading-space]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[newline]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[quoted]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[space]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[tab]",
+    "tests/test_main.py::test_set_key_rejects_unwritable_key[trailing-quote]",
+    "tests/test_main.py::test_set_key_round_trips_carriage_returns[CRLF]",
+    "tests/test_main.py::test_set_key_round_trips_carriage_returns[CR]",
+    "tests/test_main.py::test_set_key_round_trips_carriage_returns[lone-CRLF]",
+    "tests/test_main.py::test_set_key_round_trips_carriage_returns[lone-CR]",
+    "tests/test_main.py::test_set_key_round_trips_carriage_returns[mixed]",
+    "tests/test_main.py::test_unset_key_does_not_glue_lines_after_invalid_statement[\\n]",
+    "tests/test_main.py::test_unset_key_keeps_bom_when_key_is_missing",
+    "tests/test_main.py::test_unset_key_preserves_bom",
+    "tests/test_parser.py::test_parse_stream_recovers_whole_line_on_invalid_statement[\\r\\n]",
+    "tests/test_variables.py::test_parse_variables_is_linear_on_unterminated_expansions",
+    "tests/test_variables.py::test_variable_resolve_default_semantics[env1-d-d]",
+    "tests/test_variables.py::test_variable_resolve_default_semantics[env2-d-d]"
+  ],
+  "defects": [
+    {
+      "id": "D1",
+      "area": "parser",
+      "severity": "high",
+      "title": "CRLF error recovery eats only CR: line numbers shift, lines glue"
+    },
+    {
+      "id": "D2",
+      "area": "main",
+      "severity": "high",
+      "title": "rewrite() converts the whole file's line endings"
+    },
+    {
+      "id": "D3",
+      "area": "main",
+      "severity": "medium",
+      "title": "set_key/unset_key drop a leading UTF-8 BOM"
+    },
+    {
+      "id": "D4",
+      "area": "main",
+      "severity": "medium",
+      "title": "a CR inside a value reads back as LF"
+    },
+    {
+      "id": "D5",
+      "area": "cli",
+      "severity": "high",
+      "title": "CLI decodes with the process locale, not the UTF-8 it writes"
+    },
+    {
+      "id": "D6",
+      "area": "main",
+      "severity": "high",
+      "title": "set_key accepts keys that read back as a different variable"
+    },
+    {
+      "id": "D7",
+      "area": "variables",
+      "severity": "medium",
+      "title": "${name:-default} ignores the default for empty values"
+    },
+    {
+      "id": "D8",
+      "area": "main",
+      "severity": "medium",
+      "title": "a bare NAME declaration masks the real environment variable"
+    },
+    {
+      "id": "D9",
+      "area": "main",
+      "severity": "medium",
+      "title": "load_dotenv() returns True when nothing was set"
+    },
+    {
+      "id": "D10",
+      "area": "variables",
+      "severity": "medium",
+      "title": "parse_variables is quadratic on unterminated ${"
+    }
+  ],
+  "mutations": {
+    "run_mutations.py": 13,
+    "run_mutations2.py": 4
+  },
+  "mutations_total": 17,
+  "mutations_killed": 17
+}
