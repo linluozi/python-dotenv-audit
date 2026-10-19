@@ -10,6 +10,8 @@
 
 ## 1. 摘要
 
+![Ten confirmed defects, grouped by module](figures/defects.png)
+
 | # | 缺陷 | 严重度 | 触发条件 | 修复文件 |
 |---|------|--------|----------|----------|
 | 1 | CRLF 文件里「非法语句」恢复只吃掉 `\r`，行号错位 + 删行时把两行粘在一起 | 高 | 任意含非法语句的 CRLF `.env` + `set_key`/`unset_key` | `parser.py` |
@@ -204,17 +206,20 @@ load_dotenv(stream=StringIO("A\nB\n"))   修复前 True，但 os.environ 一个�
 
 ### 缺陷 10 — `parse_variables` 二次复杂度
 
-**复现**（修复前，`"${" * n`）：
+**复现**（`"${" * n`）。每个 (臂, 规模) 独立进程，3 轮交错，每轮取 3 次进程内重复的中位数；
+下表是 3 轮的中位数，区间为跨轮 min–max（原始数据 `audit/results_perf.json`）：
 
-| n | 字符数 | 修复前 | 修复后 |
-|---|--------|--------|--------|
-| 1000 | 2,000 | 27 ms | 0.01 ms |
-| 2000 | 4,000 | 113 ms | 0.01 ms |
-| 4000 | 8,000 | 438 ms | 0.01 ms |
-| 8000 | 16,000 | **1,768 ms** | 0.01 ms |
-| 16000 | 32,000 | **7,770 ms** | 0.02 ms |
+| 字符数 | 修复前（中位 / 区间） | 修复后（中位 / 区间） |
+|--------|----------------------|----------------------|
+| 2,000 | 28.4 ms / 26.8–31.0 | 0.003 ms / 0.002–0.004 |
+| 4,000 | 111.8 ms / 109.1–145.7 | 0.002 ms / 0.002–0.002 |
+| 8,000 | 436.1 ms / 431.0–500.3 | 0.002 ms / 0.002–0.003 |
+| 16,000 | **1,775.9 ms** / 1773.2–1787.4 | 0.002 ms / 0.002–0.002 |
 
-每翻一倍耗时 ×4，教科书式 O(n²)。经 `load_dotenv` 可达：8000 字符的恶意/截断值耗时 0.51 s，32 KB 约 8 s——单线程应用直接被拖住。
+**增长因子**（4 倍输入）：修复前 **15.4×**（≈16×，教科书式 O(n²)），修复后 **0.6×**（线性）。
+经 `load_dotenv` 可达：16 KB 的恶意/截断值要 1.8 秒，32 KB 约 7.7 秒——单线程应用直接被拖住。
+
+![parse_variables before and after](figures/perf_parse_variables.png)
 
 **根因**：`\$\{(?P<name>[^\}:]*)(?::-(?P<default>[^\}]*))?\}` 的 name 组是贪婪的。对一串 `${` 且**全无 `}`** 的输入，引擎在每个起点把整个剩余串吞进 name，再一个字符一个字符回溯找 `}`，每个起点 O(n) ⇒ 总共 O(n²)。
 
@@ -237,15 +242,15 @@ load_dotenv(stream=StringIO("A\nB\n"))   修复前 True，但 os.environ 一个�
 
 ### 3.2 反向验证：新测试在**未修复**代码上必须红
 
-把新测试文件原样拷到未修复的基线跑，再用「基线失败集合 ∩ 修复后失败集合」扣掉那 22 个环境失败：
+把新测试文件原样拷到未修复的基线跑（同一套环境、同一套依赖）：
 
 ```
 $ cd verify_red && pytest tests -q
-58 failed, 248 passed, 50 skipped
-
-$ comm -13 <(修复后的失败集合) <(基线的失败集合) | wc -l
-36          ← 只有新测试才报红，且全部对应已确认缺陷
+36 failed, 270 passed, 50 skipped
 ```
+
+这 36 条全部落在新增用例上，且逐条对应已确认缺陷——没有任何一条既有用例变红，
+说明这些用例确实在检验新行为，而不是被顺手改绿的。
 
 节选：
 
@@ -270,6 +275,8 @@ FAILED test_cli.py::test_set_rejects_key_the_parser_cannot_read_back
 其中性能用例在旧代码上 `large_elapsed / small_elapsed ≈ 19×`（多轮实测 7.1 s / 8.3 s 两种，4 倍输入对应 ~16–19 倍耗时，符合 O(n²)），新代码同一断言下 `large_elapsed` 为 0.004–0.02 ms。
 
 ### 3.3 变异测试：确认测试不是摆设
+
+![Mutations and how many tests catch each](figures/mutations.png)
 
 逐条把修复「改回去」，看测试能不能抓到（`run_mutations.py` / `run_mutations2.py`）：
 
@@ -302,13 +309,32 @@ KILLED | line terminator detection removed (fallback only)
 
 ### 3.4 无回归
 
+![Suite size and detection](figures/test_coverage.png)
+
+
 ```
-基线（未修复）: 22 failed, 213 passed, 50 skipped
-修复后        : 22 failed, 284 passed, 50 skipped   (+71 passed)
-失败集合 diff  : 完全相同
+基线（未修复）: 235 passed, 0 failed, 50 skipped
+修复后        : 306 passed, 0 failed, 50 skipped   (+71 passed)
+失败集合 diff  : 空（两边都是 0 失败）
 ```
 
-那 22 个失败全部是 Windows 环境限制，与本次改动无关：`dotenv` 命令行入口未安装（`test_cli.py` 的 `run` 系列）、`subprocess` 调 `sh`/`bash`（`test_main.py::test_load_dotenv_in_current_dir`、`test_zip_imports`）。**基线就红，换文件后失败集合一字不差** ⇒ 无回归。
+**这里要更正一处我先前的错误结论。** 本轮早期我跑出过「22 failed」并把它们归因为
+「Windows 环境限制，无法避免」。这个归因是错的：真实原因是**这个沙箱没装 `dotenv`
+命令行入口，且没有导出 `SYSTEMROOT`/`COMSPEC`**，导致 `test_cli.py` 里用
+`subprocess` 起 `dotenv` 的 20 个用例报 `FileNotFoundError`。
+
+执行 `pip install -e .` 并补全环境变量后：
+
+```
+基线   235 passed, 0 failed, 50 skipped
+修复后 306 passed, 0 failed, 50 skipped
+```
+
+两边都干净。把「自己环境没配好」写成「上游在 Windows 上跑不过」，是我这一轮最该
+记住的教训——**报环境限制之前，先证明在自己手里它能不能绿**。
+
+（那 50 个 skip 是上游自己的 POSIX-only 用例：符号链接、FIFO、`chmod`、`tzset`，
+在 Windows 上按设计跳过。）
 
 ### 3.5 项目自身 CI
 
@@ -395,12 +421,12 @@ python-dotenv-audit-2026-10-18/
 **复跑**：
 
 ```bash
-cd python-dotenv && PYTHONPATH=src python -m pytest tests -q   # 22 failed(Windows 环境) / 284 passed
+cd python-dotenv && pip install -e . && pytest tests -q   # 306 passed, 50 skipped
 cd .. && python evidence/cross_platform.py                      # 19/19
 python evidence/acceptance.py                                   # 修复后行为表
 python evidence/run_mutations.py                                # 13/13 KILLED
 ```
 
 > ZIP 已做过的验收：`testzip()` 无损坏成员；67 个文件、无 `__pycache__`/`.git` 泄漏；所有文本文件的行尾都是 LF；
-> **解压到全新目录后** `pytest` 得 22 failed / 284 passed（与工作区一致）、`cross_platform.py` 19/19、
+> **解压到全新目录后** `pytest` 得 306 passed / 0 failed（与工作区一致）、`cross_platform.py` 19/19、
 > `acceptance.py` rc=0；补丁在干净上游基线上 `patch --binary -p1` 后与交付源码**逐字节相同**。

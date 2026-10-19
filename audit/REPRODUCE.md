@@ -9,14 +9,21 @@
 ## 前置
 
 ```bash
+# 先装本包：test_cli.py 会以子进程方式调用 dotenv 命令行入口。
+# 不装的话 20 个 CLI 用例会报 FileNotFoundError —— 那是环境问题，不是包的问题。
+pip install -e .
+
 # 未修复基线（= 上游 commit 0b28805 的 git archive 导出）
-cd baseline && PYTHONPATH=src python -m pytest tests -q
-# 22 failed, 213 passed, 50 skipped   （22 个是 Windows 环境限制，见 REPORT §3.4）
+cd baseline && pytest tests -q
+# 235 passed, 0 failed, 50 skipped
 
 # 修复后
-cd .. && PYTHONPATH=src python -m pytest tests -q
-# 22 failed, 284 passed, 50 skipped   （失败集合完全相同）
+cd .. && pytest tests -q
+# 306 passed, 0 failed, 50 skipped
 ```
+
+> 50 个 skip 是上游自己的 POSIX-only 用例（符号链接 / FIFO / `chmod` / `tzset`），
+> Windows 上按设计跳过。这些行为改用 `evidence/cross_platform.py` 做字节级断言覆盖。
 
 ---
 
